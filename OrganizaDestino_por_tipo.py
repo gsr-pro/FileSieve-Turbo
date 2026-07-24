@@ -345,61 +345,152 @@ _PERIOD_FROM_PATH = re.compile(r"[/\\](20\d{2})[/\\-]?(0[1-9]|1[0-2])[/\\]")
 def _xml_local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1] if "}" in tag else tag
 
-def inferir_tipo_sped_por_0000(path: str) -> str | None:
+def ler_primeiras_linhas_txt(path: str, max_linhas: int = 100) -> list[str]:
+    """
+    Lê apenas as primeiras `max_linhas` do arquivo utilizando leitura em buffer binário,
+    evitando carregar arquivos gigantes na memória.
+    Trata variações comuns de encoding (utf-8, cp1252, latin-1).
+    """
+    linhas = []
     try:
-        with open(path, "r", encoding="latin-1") as f:
-            line = f.readline().strip()
-            if line.startswith("|0000|"):
-                parts = line.split("|")
-                if len(parts) >= 6:
-                    reg = parts[2].strip()
-                    if reg == "ECD":
-                        return "SPED_ECD"
-                    elif reg == "ECF":
-                        return "SPED_ECF"
-                    elif reg == "EFD":
-                        return "SPED_EFD"
-                    elif reg == "FISS":
-                        return "SPED_FISS"
-                    else:
-                        return "SPED_OUTRO"
+        with open(path, "rb") as f:
+            for _ in range(max_linhas):
+                raw_line = f.readline()
+                if not raw_line:
+                    break
+                try:
+                    line = raw_line.decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    try:
+                        line = raw_line.decode("cp1252").strip()
+                    except UnicodeDecodeError:
+                        line = raw_line.decode("latin-1", errors="replace").strip()
+                linhas.append(line)
     except Exception:
         pass
-    return None
+    return linhas
+
+
+def identificar_tipo_sped(path: str, max_linhas: int = 300) -> str:
+    """
+    Abre o arquivo .txt, lê apenas as primeiras linhas (em buffer) e identifica o tipo do SPED.
+    Regras de Identificação:
+    1. ECD: O registro |0000| contém a string LECD no campo 2 (ou registros do Bloco I/J).
+    2. ECF: O registro |0000| contém a string LECF no campo 2 (ou registros |0010|, |X001|, |Y001|).
+    3. EFD ICMS IPI: Possui registros como |E110|, |E210|, |E300|, |0005|, |0300|, |0400|, |H001|, |K001| ou estrutura do 0000 (DT_INI no campo 4).
+    4. EFD Contribuições: Possui registros como |0110|, |0111|, |0120|, |M200|, |M600|, |F001|, |A001|, |C010| ou estrutura do 0000 (DT_INI no campo 6).
+    5. EFD Reinf: Possui registros ou tags próprias da Reinf (|R1000|, |R2010|, etc.).
+    6. Se não puder ser identificado, retorna 'Nao_Identificados'.
+    """
+    try:
+        linhas = ler_primeiras_linhas_txt(path, max_linhas=max_linhas)
+        if not linhas:
+            return "Nao_Identificados"
+
+        tem_0000 = False
+        registro_0000_line = ""
+
+        # Localizar registro de abertura |0000|
+        for line in linhas:
+            if line.startswith("|0000|"):
+                tem_0000 = True
+                registro_0000_line = line
+                break
+
+        if tem_0000:
+            parts = [p.strip() for p in registro_0000_line.split("|")]
+            # parts[0] == '', parts[1] == '0000', parts[2] == campo 2
+            campo2 = parts[2].upper() if len(parts) > 2 else ""
+
+            # 1. ECD: Escrituração Contábil Digital (|0000|LECD|...)
+            if "LECD" in campo2 or campo2 == "ECD":
+                return "ECD"
+
+            # 2. ECF: Escrituração Contábil Fiscal (|0000|LECF|...)
+            if "LECF" in campo2 or campo2 == "ECF":
+                return "ECF"
+
+        # Registros específicos e exclusivos do Bloco 0 ou de apuração
+        # 3. EFD Contribuições (PIS/COFINS):
+        regs_efd_contribuicoes = (
+            "|0110|", "|0111|", "|0120|", "|0130|", "|0900|",
+            "|M200|", "|M600|", "|M100|", "|M500|", "|M001|", "|M105|", "|M505|",
+            "|F001|", "|F100|", "|A001|", "|A100|", "|C010|"
+        )
+
+        # 4. EFD ICMS IPI (SPED Fiscal):
+        regs_efd_icms_ipi = (
+            "|0005|", "|0015|", "|0175|", "|0205|", "|0206|", "|0300|", "|0305|", "|0400|", "|0450|", "|0460|",
+            "|E110|", "|E210|", "|E300|", "|E100|", "|E500|", "|E520|", "|E001|",
+            "|H001|", "|K001|", "|G001|"
+        )
+
+        # 5. EFD Reinf:
+        regs_efd_reinf = ("|R1000|", "|R2010|", "|R4010|", "|R9000|")
+
+        for line in linhas:
+            if not line.startswith("|"):
+                continue
+
+            if any(reg in line for reg in regs_efd_contribuicoes):
+                return "EFD_Contribuicoes"
+
+            if any(reg in line for reg in regs_efd_icms_ipi):
+                return "EFD_ICMS_IPI"
+
+            if any(reg in line for reg in regs_efd_reinf) or "REINF" in line.upper():
+                return "EFD_REINF"
+
+        # Validação adicional baseada na estrutura do registro |0000| caso nenhum registro exclusivo esteja nas linhas lidas
+        if tem_0000:
+            parts = [p.strip() for p in registro_0000_line.split("|")]
+            # Se parts tem a estrutura típica do 0000 do SPED Fiscal (DT_INI no campo 4 com 8 dígitos)
+            if len(parts) >= 8 and len(parts[4]) == 8 and parts[4].isdigit() and len(parts[5]) == 8 and parts[5].isdigit():
+                return "EFD_ICMS_IPI"
+            # Se parts tem a estrutura típica do 0000 do EFD Contribuições (DT_INI no campo 6 com 8 dígitos)
+            if len(parts) >= 10 and len(parts[6]) == 8 and parts[6].isdigit() and len(parts[7]) == 8 and parts[7].isdigit():
+                return "EFD_Contribuicoes"
+
+        return "Nao_Identificados"
+    except Exception:
+        return "Nao_Identificados"
+
 
 def classify_file_fast(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+
+    # Se for arquivo .txt, aplicar classificação otimizada de SPED por cabeçalho
+    if ext == ".txt":
+        return identificar_tipo_sped(path)
+
     try:
         with open(path, "rb") as f:
             chunk = f.read(4096)
             chunk_upper = chunk.upper()
-            
-            # XML: detectar CTe/cteProc antes de NFe para evitar falsos positivos
-            if b"<INUTNFE" in chunk_upper or b":INUTNFE" in chunk_upper:
+
+            # Se arquivo sem extensão .txt possui cabeçalho de SPED |0000|
+            first_pipe = chunk.find(b"|")
+            if first_pipe != -1 and chunk[first_pipe:first_pipe+6] == b"|0000|":
+                return identificar_tipo_sped(path)
+
+            # XML: detectar Inutilizados de NF-e e CT-e antes de NFe/CTe normais
+            if b"INUTNFE" in chunk_upper or b"INUTCTE" in chunk_upper:
                 return "INUTILIZADO"
             if b"INFCTE" in chunk_upper or b"CTEPROC" in chunk_upper:
                 return "CTE"
             if b"INFNFE" in chunk_upper:
                 return "NFE"
-            
-            # SPED
-            first_pipe = chunk.find(b"|")
-            if first_pipe != -1 and chunk[first_pipe:first_pipe+6] == b"|0000|":
-                inferred = inferir_tipo_sped_por_0000(path)
-                if inferred:
-                    return inferred
-            
+
             # NFSe - verificar primeiro para evitar confusão com tags como cep_evento
             has_nfse_tag = any(tag.upper().encode() in chunk_upper for tag in _NFSE_TAGS)
             if has_nfse_tag:
                 if b"DPS" in chunk_upper or b"IBSCBS" in chunk_upper or b"_CBSIBS" in chunk_upper:
                     return "NFSE_NACIONAL"
                 return "NFSE_MUNICIPAL_LEGADO"
-            
+
             # Eventos - verificar apenas se não for NFSe
             for marker in _EVENTO_MARKERS:
                 marker_bytes = marker.encode()
-                # Verificar que o marker não está dentro de outra tag (como <cep_evento>)
-                # Procurar por <EVENTO, >EVENTO, EVENTO>, ou EVENTO com espaço em branco ao redor
                 if (b"<" + marker_bytes in chunk_upper or 
                     b">" + marker_bytes in chunk_upper or 
                     marker_bytes + b">" in chunk_upper or
@@ -407,12 +498,12 @@ def classify_file_fast(path: str) -> str:
                     return "EVENTO"
     except Exception:
         pass
-    
+
     # Fallback para lxml se for XML
     if not path.lower().endswith(".xml") or not HAS_LXML:
-        ext = os.path.splitext(path)[1].lower().strip(".")
-        return ext.upper() if ext else "OUTROS"
-    
+        ext_clean = ext.strip(".")
+        return ext_clean.upper() if ext_clean else "OUTROS"
+
     root_tag = None
     is_nfse = False
     is_nacional = False
@@ -425,9 +516,9 @@ def classify_file_fast(path: str) -> str:
                     root_upper = root_tag.upper()
                     if any(root_upper.startswith(m) or m in root_upper for m in _EVENTO_MARKERS):
                         return "EVENTO"
-                    if root_upper == "INUTNFE":
+                    if any(m in root_upper for m in ("INUTNFE", "INUTCTE")):
                         return "INUTILIZADO"
-                if tag == "inutNFe":
+                if "inutNFe" in tag or "inutCTe" in tag or "infInut" in tag:
                     return "INUTILIZADO"
                 if tag == "infNFe":
                     return "NFE"
@@ -446,15 +537,15 @@ def classify_file_fast(path: str) -> str:
                 elem.clear()
     except Exception:
         pass
-    
+
     if is_nfse:
         return "NFSE_NACIONAL" if is_nacional else "NFSE_MUNICIPAL_LEGADO"
     root_upper = (root_tag or "").upper()
     if any(root_upper.startswith(m) or m in root_upper for m in _EVENTO_MARKERS):
         return "EVENTO"
-    
-    ext = os.path.splitext(path)[1].lower().strip(".")
-    return ext.upper() if ext else "OUTROS"
+
+    ext_clean = ext.strip(".")
+    return ext_clean.upper() if ext_clean else "OUTROS"
 
 # ========================
 # Mover rápido + sharding
@@ -542,12 +633,20 @@ def listar_arquivos(root: str, q: Queue):
             continue
     return total_listados
 
+def criar_pastas_destino_obrigatorias(destino_base: str):
+    """Cria automaticamente as pastas destino padrão se elas ainda não existirem."""
+    pastas = ["ECD", "ECF", "EFD_ICMS_IPI", "EFD_Contribuicoes", "Nao_Identificados"]
+    for p in pastas:
+        ensure_folder(os.path.join(destino_base, p))
+
 def worker_classificar_e_mover(q: Queue, destino_base: str, stats: dict, lock: threading.Lock):
     while True:
         p = q.get()
         if p is None:
             q.task_done()
             break
+        tipo = "Nao_Identificados"
+        destino_pasta = ""
         try:
             nome = os.path.basename(p)
             tipo = classify_file_fast(p)
@@ -559,7 +658,16 @@ def worker_classificar_e_mover(q: Queue, destino_base: str, stats: dict, lock: t
                 stats[tipo] = stats.get(tipo, 0) + 1
                 stats["total"] = stats.get("total", 0) + 1
         except Exception as e:
-            log_error("organizar", "move", p, destino_pasta if 'destino_pasta' in locals() else "", tipo if 'tipo' in locals() else "", str(e))
+            log_error("organizar", "move", p, destino_pasta, tipo, str(e))
+            # Tratamento de erro: se falhar a movimentação ou classificação, tenta mover para Nao_Identificados
+            try:
+                fallback_pasta = pasta_por_tipo(os.path.basename(p), "Nao_Identificados", destino_base)
+                if os.path.abspath(os.path.dirname(p)) != os.path.abspath(fallback_pasta):
+                    _retry_move(p, fallback_pasta)
+                with lock:
+                    stats["Nao_Identificados"] = stats.get("Nao_Identificados", 0) + 1
+            except Exception as e_fallback:
+                log_error("organizar", "move_fallback", p, "", "Nao_Identificados", str(e_fallback))
             with lock:
                 stats["erros"] = stats.get("erros", 0) + 1
         finally:
@@ -597,6 +705,7 @@ def executar_organizar_por_tipo(destino: str):
     init_error_log(destino)
     logger.info("🚀 Iniciando organização POR TIPO")
     
+    criar_pastas_destino_obrigatorias(destino)
     extrair_recursivo_e_limpar(destino, max_workers=MAX_WORKERS_EXTRACT)
     organizar_por_tipo_streaming(destino, max_workers=MAX_WORKERS_MOVE)
     limpar_pastas_vazias(destino)
